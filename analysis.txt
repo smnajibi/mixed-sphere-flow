@@ -1,0 +1,10 @@
+On the sphere the longitudinal and latitudinal coordinates have distinct geometries.
+Longitude (ϕ) wraps around, so its density must be periodic.  A flow that ignores this
+periodicity can accumulate probability mass at an arbitrary branch cut and miss the fact
+that ϕ=−π and ϕ=π represent the same physical direction.  By introducing a circular shift
+and a periodic spline we ensure that the transformation acts on a circle rather than a
+line segment.  Conversely, the latitude (θ̃) lies on a bounded interval and has no
+intrinsic wrap‑around.  Using a bounded monotonic spline allows the model to flexibly
+reshape the distribution within the allowed range without introducing artificial
+periodicity.  The resulting mixed flow therefore respects the topology of S²: one
+direction is treated as circular and the other as a finite segment.
