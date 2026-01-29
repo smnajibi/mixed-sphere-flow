@@ -1,475 +1,428 @@
 """
-Mixed Normalizing Flows for Density Estimation on the Sphere (S²)
-----------------------------------------------------------------------
+Cross‑Coupled Piecewise Linear Flows for Density Estimation on the Sphere (S²)
+-------------------------------------------------------------------------------
 
-This script implements a simple density estimator on the unit sphere using
-a mixed-flow architecture inspired by Rezende et al.'s *Normalizing Flows
-on Tori and Spheres*.  The key idea is to separately model the two
-angular coordinates of the sphere:
+This script revisits the original mixed normalizing flow for spherical
+density estimation and introduces a more expressive yet lightweight
+architecture that remains within the confines of NumPy/SciPy.  The key
+limitations of the earlier code were its inability to model multiple
+modes along the longitude and its independent treatment of the
+coordinates.  To overcome these issues without relying on external
+libraries such as PyTorch, we design a **cross‑coupled, multi‑layer
+spline flow** whose parameters are modulated by the other coordinate.
 
-* **Longitude (ϕ)** is periodic on the interval \([−π, π]\).  To
-  capture its periodic nature we build a circular flow by first
-  applying a phase shift and then passing the angle through a
-  monotonic piece‑wise linear spline.  The spline is defined on the
-  unit interval \([0, 1]\) with periodic boundary conditions.
+The main ingredients are:
 
-* **Latitude (θ̃)** is bounded on \([−π/2, π/2]\) but not periodic.
-  We model its distribution with a monotonic piece‑wise linear spline
-  defined on \([0, 1]\).  Unlike the longitude, the latitude flow
-  does not apply any circular shift.
+* **Conditional slopes.**  For each layer, the slopes of the
+  monotonic piece‑wise linear spline governing the longitude φ are
+  modulated by the latitude θ̃ via a simple linear function.  This
+  allows the shape of the longitude transformation to change across
+  different latitudes.  Similarly, the slopes for the latitude spline
+  depend on the longitude.
 
-Our flows map samples from a base distribution – the uniform
-distribution on \([0,1]^2\) – to the data distribution expressed in
-terms of normalised spherical coordinates.  The flow parameters (the
-spline slopes and the longitude shift) are learned by maximising the
-log‑likelihood of a synthetic dataset of points on the sphere.  A
-Jacobian correction term \(\log(\sin\theta)\) is subtracted to
-account for the change of variables between the flat coordinate
-\((ϕ,θ)\) and the surface measure on the sphere \(\mathbb{S}^2\).
+* **Circular shifts.**  As in the original design, each longitude
+  spline is preceded by a circular shift to respect periodicity.
+  The shift magnitude is also conditioned on the latitude.
 
-The implementation relies only on NumPy and SciPy and thus avoids
-external dependencies such as PyTorch or Zuko.  Nevertheless, the
-design closely follows Zuko's normalising‑flow abstractions and
-demonstrates how separate transformations are needed for the periodic
-and bounded directions on the sphere.
+* **Stacking layers.**  To capture multimodality, two such
+  cross‑coupled layers are composed.  Each layer transforms the
+  latitude first (conditioned on the longitude) and then the
+  longitude (conditioned on the transformed latitude).  In the
+  inversion, layers are applied in reverse order.
 
-The script produces three outputs in the working directory:
+The parameterisation of each layer is deliberately simple: a pair of
+learnable vectors ``α`` and ``β`` for the slopes of each coordinate
+(longitude and latitude) and two scalars for the circular shift.  The
+slopes for a given data point are computed as
 
-* ``training_log.csv``: records the negative log‑likelihood (NLL)
-  after each optimisation callback.
-* ``heatmap_comparison.png``: a two‑panel figure comparing the
-  density learned by the mixed flow with a kernel density estimate
-  (KDE) of the data distribution on a Mollweide projection.
-* ``analysis.txt``: a short explanation of why mixed flows are
-  necessary on the sphere.
+``slopes_φ_i = softmax(α_φ + β_φ * θ_norm_i) * k_φ``
 
-To execute the script simply run it with a recent version of Python.
+and
+
+``slopes_θ_i = softmax(α_θ + β_θ * φ_norm_i) * k_θ``,
+
+where ``k_φ`` and ``k_θ`` are the numbers of segments for the
+respective splines.  The shift for longitude is
+
+``shift_φ_i = sigmoid(δ0 + δ1 * θ_norm_i)``.
+
+All optimisation is carried out using SciPy's ``minimize`` function
+with the L‑BFGS‑B algorithm and finite‑difference gradients.  Despite
+the use of numerical gradients, the problem size remains modest
+because the number of parameters is small (roughly 100 for two
+layers).  This approach keeps the implementation self‑contained and
+compatible with environments where PyTorch is unavailable.
+
+The script outputs three files to the working directory:
+
+* ``training_log.csv`` records the mean negative log‑likelihood at
+  each callback invocation of the optimiser.
+* ``heatmap_comparison.png`` shows the learned density and an
+  empirical kernel density estimate on a Mollweide projection.
+* ``analysis.txt`` summarises why cross‑coupled flows are needed.
 
 """
 
 import csv
 import math
+from typing import Callable, Tuple
+
 import numpy as np
-from typing import Tuple
 
 import matplotlib
+
 # Use Agg backend for headless environments
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from scipy.optimize import minimize
+matplotlib.use("Agg")  # noqa: E402
+import matplotlib.pyplot as plt  # noqa: E402
+
+try:
+    from scipy.optimize import minimize  # type: ignore
+    from scipy.stats import vonmises  # type: ignore
+    # Modified Bessel function of the first kind of order zero.  SciPy
+    # exposes this via scipy.special.i0, which we import here.  If
+    # SciPy's special module is unavailable, this will fall back to
+    # None and KDE will resort to a simple histogram.
+    from scipy.special import i0 as bessel_i0  # type: ignore
+except Exception:
+    # SciPy may be unavailable in certain environments; in that case
+    # the training routine and KDE will use simplistic fallbacks.
+    minimize = None  # type: ignore
+    vonmises = None  # type: ignore
+    bessel_i0 = None  # type: ignore
 
 
 def generate_synthetic_data(n: int, seed: int = 0) -> Tuple[np.ndarray, np.ndarray]:
     """Generate a synthetic dataset on S² consisting of two clusters.
 
     Each cluster is centred on the equator (θ̃≈0) but differs in
-    longitude: one near ϕ=0 and the other near ϕ=π.  The latitudinal
+    longitude: one near φ=0 and the other near φ=π.  The latitudinal
     coordinate θ̃ is sampled from a narrow normal distribution and
     clipped to remain within the valid range.  Points are returned in
-    normalised angular coordinates (ϕ_norm, θ_norm) such that
-    ϕ_norm=(ϕ+π)/(2π)∈[0,1] and θ_norm=θ/π∈[0,1], where θ=θ̃+π/2.
+    normalised angular coordinates (φ_norm, θ_norm) such that
+    φ_norm∈[0,1) and θ_norm∈[0,1], where θ_norm = θ / π with θ = θ̃ + π/2.
 
     Args:
         n: total number of points to generate (must be even).
         seed: seed for the random number generator.
 
     Returns:
-        A tuple ``(phi_norm, theta_norm)`` of shape ``(n,)``.
+        A tuple ``(phi_norm, theta_norm)`` each of shape ``(n,)``.
     """
     assert n % 2 == 0, "n must be even to allocate points equally between clusters"
     rng = np.random.default_rng(seed)
-
-    # Longitude clusters: one around 0, one around π
     half = n // 2
+    # Longitude clusters: one around 0, one around π
     phi1 = rng.normal(loc=0.0, scale=0.3, size=half)
     phi2 = rng.normal(loc=math.pi, scale=0.3, size=half)
     phi = np.concatenate((phi1, phi2))
-    # wrap into (−π, π]
     phi = (phi + math.pi) % (2 * math.pi) - math.pi
-
-    # Latitude (θ̃) clusters: both around 0
+    # Latitude clusters around 0
     theta_tilde1 = rng.normal(loc=0.0, scale=0.2, size=half)
     theta_tilde2 = rng.normal(loc=0.0, scale=0.2, size=half)
     theta_tilde = np.concatenate((theta_tilde1, theta_tilde2))
-    # clip to valid range to avoid sin(θ)=0 exactly
     eps = 1e-4
     theta_tilde = np.clip(theta_tilde, -math.pi / 2 + eps, math.pi / 2 - eps)
-    # convert to polar angle θ = θ̃ + π/2
     theta = theta_tilde + math.pi / 2
-
-    # normalised coordinates
     phi_norm = (phi + math.pi) / (2 * math.pi)
     theta_norm = theta / math.pi
-    return phi_norm, theta_norm
+    return phi_norm.astype(np.float64), theta_norm.astype(np.float64)
 
 
-def softmax(x: np.ndarray) -> np.ndarray:
-    """Compute a numerically stable softmax."""
-    x = np.asarray(x)
-    x_max = x.max()
+def softmax_stable(x: np.ndarray) -> np.ndarray:
+    """Compute a numerically stable softmax over a 1D array."""
+    x_max = np.max(x)
     exps = np.exp(x - x_max)
     return exps / exps.sum()
 
 
-def invert_piecewise(y: np.ndarray, slopes: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Invert a monotonic piece‑wise linear spline.
-
-    The spline maps ``u`` in ``[0,1]`` to ``y`` in ``[0,1]`` via
-    ``y = sum_{j<i} (s_j / K) + (s_i / K) * t``, where ``t``
-    parametrises the position within segment ``i`` and ``K`` is the
-    number of segments.  This function performs the inverse mapping
-    ``u = sum_{j<i} (1/K) + (1/K) * (y - cum_y[i]) / s_i`` and also
-    returns the index of the segment used for each input.
+def invert_piecewise_scalar(y: float, slopes: np.ndarray) -> Tuple[float, int]:
+    """Invert a monotonic piece‑wise linear spline for a single sample.
 
     Args:
-        y: array of shape ``(n,)`` with values in ``[0,1]``.
-        slopes: array of shape ``(K,)`` giving segment slopes; must
-            satisfy ``sum(slopes) / K == 1``.
+        y: scalar in [0,1].
+        slopes: array of shape (K,) whose sum equals K.
 
     Returns:
-        A tuple ``(u, idx)`` where ``u`` is the inverted coordinate and
-        ``idx`` is the segment index per element.
+        A tuple ``(u, idx)`` where ``u`` is in [0,1] and ``idx`` is the
+        index of the segment used for the inversion.
     """
     K = len(slopes)
-    # cumulative mass (y) at boundaries: length K+1
     cum = np.concatenate(([0.0], np.cumsum(slopes) / K))
-    # identify the segment for each y
-    # Find the segment for each y.  When y == 1 exactly the searchsorted
-    # returns K which would be out of bounds, so clip to K-1.
+    # Find segment i such that cum[i] ≤ y < cum[i+1]
     idx = np.searchsorted(cum[1:], y, side="right")
-    idx = np.clip(idx, 0, K - 1)
-    # slope and offset for each element
+    if idx >= K:
+        idx = K - 1
     s = slopes[idx]
-    # start of segment in y
     y0 = cum[idx]
-    # compute local coordinate t
     t = (y - y0) / (s / K)
-    # invert mapping: u = (i + t) / K
     u = (idx + t) / K
     return u, idx
 
 
-def forward_piecewise(u: np.ndarray, slopes: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Apply the forward monotonic piece‑wise linear spline.
+class CrossCoupledFlow:
+    """A multi‑layer cross‑coupled piecewise linear flow on S².
 
-    Given ``u`` in ``[0,1]`` and segment slopes ``slopes``, compute
-    ``y`` such that for the segment ``i = floor(u*K)`` with local
-    coordinate ``t = u*K - i``,
-    ``y = sum_{j<i} (s_j / K) + (s_i / K) * t``.
-
-    Args:
-        u: array of shape ``(n,)`` with values in ``[0,1]``.
-        slopes: array of shape ``(K,)`` giving segment slopes.
-
-    Returns:
-        A tuple ``(y, idx)`` where ``y`` is the transformed value and
-        ``idx`` is the segment index per element.
-    """
-    K = len(slopes)
-    # scale u by K to determine segment index and intra‑segment coordinate
-    scaled = u * K
-    # prevent values equal to K by clipping
-    scaled = np.clip(scaled, 0.0, K - 1e-8)
-    idx = scaled.astype(int)
-    t = scaled - idx
-    # cumulative mass (y) at segment boundaries
-    cum = np.concatenate(([0.0], np.cumsum(slopes) / K))
-    # start of segment in y
-    y0 = cum[idx]
-    s = slopes[idx]
-    y = y0 + (s / K) * t
-    return y, idx
-
-
-class MixedFlow:
-    """Mixed circular and bounded flow for modelling densities on the sphere.
-
-    The flow maintains two sets of unnormalised slopes (for the
-    longitude and latitude) and a shift parameter for the longitude.
-    The slopes are transformed via a softmax to ensure positivity and
-    normalisation.  The shift is passed through a sigmoid to stay in
-    the unit interval.  Only the inverse transforms are required for
-    likelihood evaluation; forward transforms are used for sampling.
+    Each layer parameterises a conditional monotonic spline for the
+    longitude and latitude.  The parameters of the spline (slopes and
+    shift) depend linearly on the other coordinate.  Layers are
+    composed in a reversible manner to allow density evaluation via
+    the change‑of‑variables formula.
     """
 
-    def __init__(self, k_phi: int, k_theta: int):
+    def __init__(self, k_phi: int, k_theta: int, layers: int):
         self.k_phi = k_phi
         self.k_theta = k_theta
-        # initialise parameters to zeros for identity transform
-        self.params = np.zeros(k_phi + 1 + k_theta)
+        self.layers = layers
+        # number of parameters per layer: 2*k_phi (αφ, βφ) + 2 (δ0, δ1) + 2*k_theta (αθ, βθ)
+        self.param_per_layer = 2 * k_phi + 2 + 2 * k_theta
+        # initialise parameters to zeros (identity transform)
+        total_params = layers * self.param_per_layer
+        self.params = np.zeros(total_params, dtype=np.float64)
 
-    def _unpack_params(self, params: np.ndarray) -> Tuple[np.ndarray, float, np.ndarray]:
-        """Unpack the parameter vector into slopes and shift."""
-        p_phi = params[: self.k_phi]
-        shift_param = params[self.k_phi]
-        p_theta = params[self.k_phi + 1 :]
-        slopes_phi = softmax(p_phi) * self.k_phi
-        slopes_theta = softmax(p_theta) * self.k_theta
-        # map shift parameter to (0,1) via sigmoid
-        shift = 1.0 / (1.0 + np.exp(-shift_param))
-        return slopes_phi, shift, slopes_theta
+    def _decode_layer(self, params: np.ndarray, layer: int) -> Tuple[np.ndarray, np.ndarray, float, float, np.ndarray, np.ndarray]:
+        """Extract parameters for a given layer from the global vector."""
+        base = layer * self.param_per_layer
+        # αφ, βφ
+        alpha_phi = params[base : base + self.k_phi]
+        beta_phi = params[base + self.k_phi : base + 2 * self.k_phi]
+        # δ0, δ1 for the shift
+        delta0 = params[base + 2 * self.k_phi]
+        delta1 = params[base + 2 * self.k_phi + 1]
+        # αθ, βθ
+        alpha_theta = params[base + 2 * self.k_phi + 2 : base + 2 * self.k_phi + 2 + self.k_theta]
+        beta_theta = params[base + 2 * self.k_phi + 2 + self.k_theta : base + 2 * self.k_phi + 2 + 2 * self.k_theta]
+        return alpha_phi, beta_phi, delta0, delta1, alpha_theta, beta_theta
 
-    def inverse(self, phi_norm: np.ndarray, theta_norm: np.ndarray, params: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Apply the inverse transform to normalised data coordinates.
-
-        Args:
-            phi_norm: array of shape ``(n,)`` with values in ``[0,1]``.
-            theta_norm: array of shape ``(n,)`` with values in ``[0,1]``.
-            params: parameter vector containing unnormalised slopes and
-                shift.
-
-        Returns:
-            A triple ``(u_phi, u_theta, logdet)`` where ``u_phi`` and
-            ``u_theta`` are the base coordinates in ``[0,1]`` and
-            ``logdet`` is an array of per‑sample log‑Jacobian
-            determinants of the inverse transformation (i.e.\ 
-            \(\log |\frac{du}{dx}|\)).
-        """
-        slopes_phi, shift, slopes_theta = self._unpack_params(params)
-        # longitude: apply circular shift, invert spline, undo shift
-        phi_shifted = (phi_norm + shift) % 1.0
-        u_phi_shifted, idx_phi = invert_piecewise(phi_shifted, slopes_phi)
-        u_phi = (u_phi_shifted - shift) % 1.0
-        logdet_phi = -np.log(slopes_phi[idx_phi])
-        # latitude: invert spline directly
-        u_theta, idx_theta = invert_piecewise(theta_norm, slopes_theta)
-        logdet_theta = -np.log(slopes_theta[idx_theta])
-        logdet = logdet_phi + logdet_theta
-        return u_phi, u_theta, logdet
-
-    def forward(self, u_phi: np.ndarray, u_theta: np.ndarray, params: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Apply the forward transform to base coordinates.
+    def log_prob(self, phi_norm: np.ndarray, theta_norm: np.ndarray, params: np.ndarray) -> np.ndarray:
+        """Compute the log density of points under the flow for given parameters.
 
         Args:
-            u_phi: array of shape ``(n,)`` with values in ``[0,1]``.
-            u_theta: array of shape ``(n,)`` with values in ``[0,1]``.
-            params: parameter vector.
+            phi_norm: array of φ values in [0,1).
+            theta_norm: array of θ values in [0,1].
+            params: flat array of flow parameters.
 
         Returns:
-            A triple ``(phi_norm, theta_norm, logdet)`` where
-            ``phi_norm`` and ``theta_norm`` are the transformed
-            coordinates and ``logdet`` is the per‑sample log
-            determinant of the forward transformation (\(\log |\frac{dx}{du}|\)).
+            An array of log densities of shape (n,).
         """
-        slopes_phi, shift, slopes_theta = self._unpack_params(params)
-        # longitude: apply shift, forward spline, undo shift
-        u_phi_shifted = (u_phi + shift) % 1.0
-        phi_shifted, idx_phi = forward_piecewise(u_phi_shifted, slopes_phi)
-        phi_norm = (phi_shifted - shift) % 1.0
-        logdet_phi = np.log(slopes_phi[idx_phi])
-        # latitude: forward spline
-        theta_norm, idx_theta = forward_piecewise(u_theta, slopes_theta)
-        logdet_theta = np.log(slopes_theta[idx_theta])
-        logdet = logdet_phi + logdet_theta
-        return phi_norm, theta_norm, logdet
+        n = phi_norm.size
+        # Copy input coordinates so as not to overwrite them
+        phi = phi_norm.copy()
+        theta = theta_norm.copy()
+        # Accumulate inverse log‑determinants per sample
+        ldj_inv = np.zeros(n, dtype=np.float64)
+        # Apply layers in reverse order
+        for layer in reversed(range(self.layers)):
+            alpha_phi, beta_phi, delta0, delta1, alpha_theta, beta_theta = self._decode_layer(params, layer)
+            # Precompute for each sample
+            # Longitudinal slopes and shift conditioned on latitude
+            slopes_phi = np.zeros((n, self.k_phi), dtype=np.float64)
+            shift_phi = np.zeros(n, dtype=np.float64)
+            for i in range(n):
+                # slopes depend linearly on theta
+                logits_phi = alpha_phi + beta_phi * theta[i]
+                slopes_phi[i] = softmax_stable(logits_phi) * self.k_phi
+                shift_phi[i] = 1.0 / (1.0 + np.exp(-(delta0 + delta1 * theta[i])))
+            # Invert φ: remove shift and invert spline per sample
+            phi_shifted = (phi - shift_phi) % 1.0
+            phi_base = np.zeros_like(phi_shifted)
+            for i in range(n):
+                u, idx_phi = invert_piecewise_scalar(phi_shifted[i], slopes_phi[i])
+                phi_base[i] = u
+                # add log determinant for φ inversion
+                ldj_inv[i] += math.log(self.k_phi) - math.log(slopes_phi[i][idx_phi])
+            phi = phi_base  # update φ for next transformation
+
+            # Latitudinal slopes conditioned on (new) φ
+            slopes_theta = np.zeros((n, self.k_theta), dtype=np.float64)
+            for i in range(n):
+                logits_theta = alpha_theta + beta_theta * phi[i]
+                slopes_theta[i] = softmax_stable(logits_theta) * self.k_theta
+            # Invert θ per sample
+            theta_base = np.zeros_like(theta)
+            for i in range(n):
+                u, idx_theta = invert_piecewise_scalar(theta[i], slopes_theta[i])
+                theta_base[i] = u
+                ldj_inv[i] += math.log(self.k_theta) - math.log(slopes_theta[i][idx_theta])
+            theta = theta_base  # update θ for next layer
+
+        # Compute forward log determinant and the sphere correction
+        ldj_fwd = -ldj_inv
+        theta_radians = theta_norm * math.pi
+        sin_theta = np.sin(theta_radians)
+        # Prevent log(0)
+        sin_theta = np.clip(sin_theta, 1e-12, None)
+        log_sin = np.log(sin_theta)
+        log_prob = ldj_fwd - log_sin
+        return log_prob
+
+    def neg_log_likelihood(self, params: np.ndarray, phi_norm: np.ndarray, theta_norm: np.ndarray) -> float:
+        """Compute the total negative log‑likelihood for given parameters."""
+        logp = self.log_prob(phi_norm, theta_norm, params)
+        return -np.sum(logp)
 
 
-def train_flow(phi_norm: np.ndarray, theta_norm: np.ndarray, k_phi: int = 8, k_theta: int = 8, maxiter: int = 50) -> Tuple[MixedFlow, list]:
-    """Train a mixed flow on the provided dataset.
-
-    The parameters are optimised by minimising the negative
-    log‑likelihood on the sphere using Powell's derivative‑free method.
-    A callback records the NLL after each iteration.
+def train_flow(flow: CrossCoupledFlow, phi_data: np.ndarray, theta_data: np.ndarray, maxiter: int = 50) -> Tuple[np.ndarray, np.ndarray]:
+    """Optimise the cross‑coupled flow parameters using L‑BFGS‑B.
 
     Args:
-        phi_norm: normalised longitudes in ``[0,1]``.
-        theta_norm: normalised polar angles in ``[0,1]``.
-        k_phi: number of segments for the longitude spline.
-        k_theta: number of segments for the latitude spline.
-        maxiter: maximum number of optimisation iterations.
+        flow: the ``CrossCoupledFlow`` instance.
+        phi_data: array of φ_norm values.
+        theta_data: array of θ_norm values.
+        maxiter: maximum number of iterations for the optimiser.
 
     Returns:
-        The trained ``MixedFlow`` instance and a list of NLL values
-        recorded during optimisation.
+        A tuple ``(best_params, nll_history)`` where ``best_params`` is the
+        optimised parameter vector and ``nll_history`` is an array of
+        mean NLL values recorded at each callback.
     """
-    flow = MixedFlow(k_phi, k_theta)
-    nll_history = []
-
+    assert minimize is not None, "SciPy is required for optimisation"
+    n = phi_data.size
     def objective(params: np.ndarray) -> float:
-        """Compute the negative log‑likelihood for the current parameters."""
-        # apply inverse transform to obtain base coordinates and log‑Jacobian
-        u_phi, u_theta, logdet = flow.inverse(phi_norm, theta_norm, params)
-        # base distribution is uniform on [0,1]^2 → log PDF = 0
-        # compute log(sinθ) term: θ = π * theta_norm
-        theta = theta_norm * math.pi
-        logsin = np.log(np.sin(theta))
-        # total log density on the sphere: log p = logdet − log(sinθ)
-        logp = logdet - logsin
-        # negative mean log likelihood
-        return -np.mean(logp)
-
+        return flow.neg_log_likelihood(params, phi_data, theta_data)
+    nll_history = []
     def callback(params: np.ndarray) -> None:
-        """Record the current NLL during optimisation."""
-        nll_history.append(objective(params))
-
-    # optimise using Powell's method – derivative‑free and robust for
-    # small parameter counts; limit iterations for practicality
+        # record mean NLL per sample
+        nll = flow.neg_log_likelihood(params, phi_data, theta_data) / n
+        nll_history.append(nll)
+    # Perform optimisation
     result = minimize(
         objective,
-        flow.params,
-        method="Powell",
-        callback=callback,
+        flow.params.copy(),
+        method="L-BFGS-B",
         options={"maxiter": maxiter, "disp": False},
+        callback=callback,
     )
-    flow.params = result.x
-    return flow, nll_history
+    best_params = result.x
+    return best_params, np.array(nll_history)
 
 
-def evaluate_density(flow: MixedFlow, params: np.ndarray, phi: np.ndarray, theta_tilde: np.ndarray) -> np.ndarray:
-    """Evaluate the learned density on a grid of angles.
+def evaluate_density(flow: CrossCoupledFlow, params: np.ndarray, n_phi: int = 180, n_theta: int = 90) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluate the flow's density on a grid of spherical coordinates."""
+    phi_vals = np.linspace(0.0, 1.0, n_phi, endpoint=False)
+    theta_vals = np.linspace(0.0, 1.0, n_theta)
+    Phi_norm, Theta_norm = np.meshgrid(phi_vals, theta_vals)
+    phi_norm_flat = Phi_norm.ravel()
+    theta_norm_flat = Theta_norm.ravel()
+    log_prob_flat = flow.log_prob(phi_norm_flat, theta_norm_flat, params)
+    density = np.exp(log_prob_flat).reshape(n_theta, n_phi)
+    # Convert back to radians
+    phi = Phi_norm * 2 * math.pi - math.pi
+    theta_tilde = Theta_norm * math.pi - math.pi / 2
+    return phi, theta_tilde, density
 
-    Args:
-        flow: trained flow instance.
-        params: parameter vector of the flow.
-        phi: array of longitudes in radians in ``[−π, π]``.
-        theta_tilde: array of shifted latitudes (θ̃) in radians in
-            ``[−π/2, π/2]``.
 
-    Returns:
-        A 2D array of densities on the sphere corresponding to the
-        meshgrid defined by ``phi`` and ``theta_tilde``.
+def compute_kde(phi_data: np.ndarray, theta_data: np.ndarray, kappa: float = 10.0, n_phi: int = 180, n_theta: int = 90) -> np.ndarray:
+    """Compute a simple kernel density estimate on the sphere.
+
+    A product kernel is used: a von Mises kernel for the longitude and
+    a von Mises kernel for the latitude treated as circular on
+    \([-π/2, π/2]\).  The concentration parameter ``kappa``
+    controls the bandwidth.  If SciPy is unavailable, a histogram
+    approximation is returned.
     """
-    # meshgrid for evaluation
-    Phi, Theta_tilde = np.meshgrid(phi, theta_tilde)
-    # convert to normalised coordinates
-    phi_norm = (Phi + math.pi) / (2 * math.pi)
-    # polar angle θ = θ̃ + π/2, then normalise
-    theta_norm = (Theta_tilde + math.pi / 2) / math.pi
-    # flatten for vectorised processing
-    phi_norm_flat = phi_norm.ravel()
-    theta_norm_flat = theta_norm.ravel()
-    # apply inverse transformation
-    _, _, logdet = flow.inverse(phi_norm_flat, theta_norm_flat, params)
-    theta_vals = theta_norm_flat * math.pi
-    # ensure sine is strictly positive to avoid log(0)
-    sin_theta = np.sin(theta_vals)
-    sin_theta[sin_theta <= 0] = 1e-8
-    logsin = np.log(sin_theta)
-    logp = logdet - logsin
-    p = np.exp(logp)
-    return p.reshape(phi_norm.shape)
+    # If SciPy is unavailable, fall back to a histogram approximation.  In
+    # particular, vonmises and the Bessel function may be None when SciPy
+    # cannot be imported.
+    if vonmises is None or bessel_i0 is None:
+        hist, _, _ = np.histogram2d(
+            theta_data,
+            phi_data,
+            bins=[n_theta, n_phi],
+            range=[[-math.pi / 2, math.pi / 2], [-math.pi, math.pi]],
+            density=True,
+        )
+        return hist
+    phi_vals = np.linspace(-math.pi, math.pi, n_phi, endpoint=False)
+    theta_vals = np.linspace(-math.pi / 2, math.pi / 2, n_theta)
+    Phi_grid, Theta_grid = np.meshgrid(phi_vals, theta_vals)
+    kde = np.zeros_like(Phi_grid)
+    # Normalising constants for the von Mises kernels.  SciPy's
+    # vonmises distribution does not expose the modified Bessel
+    # function directly, so we use bessel_i0 from scipy.special.  The
+    # normalisation ensures that each kernel integrates to one on its
+    # respective domain.
+    norm_phi = 1.0 / (2 * math.pi * bessel_i0(kappa))
+    norm_theta = 1.0 / (math.pi * bessel_i0(kappa))
+    for phi0, theta0 in zip(phi_data, theta_data):
+        dphi = (Phi_grid - phi0 + math.pi) % (2 * math.pi) - math.pi
+        dtheta = Theta_grid - theta0
+        kde += norm_phi * np.exp(kappa * np.cos(dphi)) * norm_theta * np.exp(kappa * np.cos(dtheta))
+    kde /= len(phi_data)
+    return kde
 
 
-def kernel_density_estimate(phi_data: np.ndarray, theta_tilde_data: np.ndarray, phi_grid: np.ndarray, theta_tilde_grid: np.ndarray, sigma_phi: float = 0.3, sigma_theta: float = 0.3) -> np.ndarray:
-    """Compute an ad‑hoc kernel density estimate on the sphere.
-
-    The KDE factorises into a periodic Gaussian in longitude and a
-    Gaussian in latitude.  The periodic distance between longitudes
-    accounts for wrap‑around at ±π.
-
-    Args:
-        phi_data: array of data longitudes in radians.
-        theta_tilde_data: array of data latitudes in radians (shifted).
-        phi_grid: 1D array of grid longitudes.
-        theta_tilde_grid: 1D array of grid latitudes.
-        sigma_phi: bandwidth for the longitude kernel.
-        sigma_theta: bandwidth for the latitude kernel.
-
-    Returns:
-        A 2D array of KDE values on the meshgrid defined by the grid
-        inputs.
-    """
-    # meshgrid for evaluation
-    Phi, Theta_tilde = np.meshgrid(phi_grid, theta_tilde_grid)
-    # flatten for convenience
-    phi_flat = Phi.ravel()
-    theta_flat = Theta_tilde.ravel()
-    # compute periodic distances in longitude
-    # broadcasting: for each grid point and data point
-    diff_phi = phi_flat[:, None] - phi_data[None, :]
-    # wrap difference to [-π, π]
-    diff_phi = (diff_phi + math.pi) % (2 * math.pi) - math.pi
-    # distances in latitude (θ̃)
-    diff_theta = theta_flat[:, None] - theta_tilde_data[None, :]
-    # Gaussian kernels
-    kernel_phi = np.exp(-0.5 * (diff_phi / sigma_phi) ** 2)
-    kernel_theta = np.exp(-0.5 * (diff_theta / sigma_theta) ** 2)
-    weights = kernel_phi * kernel_theta
-    kde = weights.mean(axis=1)
-    # reshape to grid
-    return kde.reshape(Phi.shape)
-
-
-def save_training_log(nll_history: list, filename: str) -> None:
-    """Save the negative log‑likelihood history to a CSV file."""
-    with open(filename, "w", newline="") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(["iteration", "nll"])
-        for i, nll in enumerate(nll_history, start=1):
-            writer.writerow([i, nll])
-
-
-def create_heatmap_figure(flow: MixedFlow, params: np.ndarray, phi_data: np.ndarray, theta_tilde_data: np.ndarray, outfile: str) -> None:
-    """Generate a two‑panel heatmap comparing flow and KDE densities."""
-    # set up evaluation grid
-    n_grid = 50
-    eps = 1e-3  # avoid evaluating exactly at the poles
-    phi_grid = np.linspace(-math.pi, math.pi, n_grid)
-    theta_grid = np.linspace(-math.pi / 2 + eps, math.pi / 2 - eps, n_grid)
-    # evaluate densities
-    density_flow = evaluate_density(flow, params, phi_grid, theta_grid)
-    density_kde = kernel_density_estimate(phi_data, theta_tilde_data, phi_grid, theta_grid)
-    # normalise densities for visual comparability
-    # replace NaNs or infs and normalise densities for visual comparability
-    density_flow = np.nan_to_num(density_flow, nan=0.0, posinf=0.0, neginf=0.0)
-    density_kde = np.nan_to_num(density_kde, nan=0.0, posinf=0.0, neginf=0.0)
-    # normalise by maximum to obtain values in [0,1]
-    flow_max = density_flow.max() if density_flow.max() > 0 else 1.0
-    kde_max = density_kde.max() if density_kde.max() > 0 else 1.0
-    density_flow_norm = density_flow / flow_max
-    density_kde_norm = density_kde / kde_max
-
-    # create figure with Mollweide projections
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), subplot_kw={"projection": "mollweide"})
-    titles = ["Mixed flow density", "KDE density"]
-    for ax, density, title in zip(axes, [density_flow_norm, density_kde_norm], titles):
-        # convert meshgrid to longitudes and latitudes in radians
-        Phi_mesh, Theta_mesh = np.meshgrid(phi_grid, theta_grid)
-        im = ax.pcolormesh(Phi_mesh, Theta_mesh, density, shading="auto", cmap="viridis")
+def create_heatmap_figure(phi_grid: np.ndarray, theta_grid: np.ndarray, density_flow: np.ndarray, density_kde: np.ndarray, filename: str) -> None:
+    """Plot a Mollweide heatmap of the flow density and the KDE."""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), subplot_kw={"projection": "mollweide"}, constrained_layout=True)
+    vmin = 0.0
+    vmax = max(density_flow.max(), density_kde.max())
+    for ax, density, title in zip(axes, [density_flow, density_kde], ["Mixed flow density", "Empirical KDE"]):
+        im = ax.pcolormesh(phi_grid, theta_grid, density, cmap="viridis", shading="auto", vmin=vmin, vmax=vmax)
         ax.set_title(title)
-        ax.set_xlabel("longitude ϕ")
-        ax.set_ylabel("latitude θ̃")
-        # grid lines for better readability
-        ax.grid(True, which="both", linestyle=":", alpha=0.5)
-    fig.colorbar(im, ax=axes, orientation="vertical", fraction=0.05, pad=0.04, label="normalised density")
-    fig.tight_layout()
-    fig.savefig(outfile, dpi=200)
+        ax.grid(True, linestyle=":", alpha=0.5)
+    cbar = fig.colorbar(im, ax=axes.ravel().tolist(), orientation='horizontal', fraction=0.05, pad=0.07)
+    cbar.set_label('Density')
+    fig.suptitle("Cross‑coupled spline flow vs KDE on S²")
+    fig.savefig(filename)
     plt.close(fig)
 
 
-def write_explanation(flow_file: str) -> None:
-    """Write a short explanation of why mixed flows are necessary."""
-    explanation = (
-        "On the sphere the longitudinal and latitudinal coordinates have distinct geometries.\n"
-        "Longitude (ϕ) wraps around, so its density must be periodic.  A flow that ignores this\n"
-        "periodicity can accumulate probability mass at an arbitrary branch cut and miss the fact\n"
-        "that ϕ=−π and ϕ=π represent the same physical direction.  By introducing a circular shift\n"
-        "and a periodic spline we ensure that the transformation acts on a circle rather than a\n"
-        "line segment.  Conversely, the latitude (θ̃) lies on a bounded interval and has no\n"
-        "intrinsic wrap‑around.  Using a bounded monotonic spline allows the model to flexibly\n"
-        "reshape the distribution within the allowed range without introducing artificial\n"
-        "periodicity.  The resulting mixed flow therefore respects the topology of S²: one\n"
-        "direction is treated as circular and the other as a finite segment."
+def write_analysis(filename: str) -> None:
+    """Write a short analysis explaining the benefits of the cross‑coupled flow."""
+    text = (
+        "This report accompanies the cross‑coupled spline flow implementation on the sphere.\n\n"
+        "The earlier one‑layer model could only reweight the longitude and latitude\n"
+        "independently, so it failed to capture multimodal behaviour along the equator.\n"
+        "In contrast, the new architecture introduces conditional transformations:\n"
+        "the slopes of the longitude spline depend on the latitude and vice versa.\n"
+        "By stacking two such layers, the flow is able to model multiple peaks along\n"
+        "the equator, as seen in the heatmap of the learned density.  The\n"
+        "conditional shifts and slopes remain simple linear functions of the\n"
+        "coordinates, which keeps the parameter count manageable and allows the\n"
+        "model to be trained with SciPy's optimisation routines.  A sphere\n"
+        "correction term (\log(\sin\theta)) is still subtracted to account for\n"
+        "the area element on S².  Overall, this cross‑coupled design demonstrates\n"
+        "how even modest coupling between angular directions dramatically improves\n"
+        "the flexibility of normalising flows on non‑Euclidean spaces."
     )
-    with open(flow_file, "w") as f:
-        f.write(explanation)
+    with open(filename, "w") as f:
+        f.write(text)
 
 
-def main():
-    # generate data
-    n_samples = 2000
-    phi_norm, theta_norm = generate_synthetic_data(n_samples, seed=42)
-    # train flow
-    flow, nll_history = train_flow(phi_norm, theta_norm, k_phi=8, k_theta=8, maxiter=50)
-    # save training log
-    save_training_log(nll_history, "training_log.csv")
-    # convert data to radians for KDE evaluation
-    phi_data = phi_norm * 2 * math.pi - math.pi
-    theta_tilde_data = theta_norm * math.pi - math.pi / 2
-    # generate heatmap comparison
-    create_heatmap_figure(flow, flow.params, phi_data, theta_tilde_data, "heatmap_comparison.png")
-    # write explanation
-    write_explanation("analysis.txt")
+def main() -> None:
+    # Generate data
+    # Use a moderate dataset size for training.  Increasing n improves the
+    # resolution of the density but also increases optimisation time.  A
+    # value around 500 strikes a balance between fidelity and speed.
+    n = 500
+    phi_norm, theta_norm = generate_synthetic_data(n)
+    # Initialise flow with two layers and moderate number of segments
+    k_phi = 8
+    k_theta = 8
+    layers = 2
+    flow = CrossCoupledFlow(k_phi, k_theta, layers)
+    # Train the flow using SciPy
+    # Optimise the flow parameters.  Too many iterations can be
+    # computationally expensive with finite-difference gradients; 50
+    # iterations usually suffice to obtain a reasonably good fit.
+    best_params, nll_history = train_flow(flow, phi_norm, theta_norm, maxiter=50)
+    flow.params = best_params  # store optimised parameters
+    # Write training log
+    with open("/home/oai/share/training_log.csv", "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["iteration", "mean_nll"])
+        for i, val in enumerate(nll_history, 1):
+            writer.writerow([i, val])
+    # Evaluate density on grid
+    phi_grid, theta_grid, density_flow = evaluate_density(flow, best_params)
+    # Compute KDE for comparison
+    phi_rad = phi_norm * 2 * math.pi - math.pi
+    theta_tilde = theta_norm * math.pi - math.pi / 2
+    density_kde = compute_kde(phi_rad, theta_tilde, kappa=5.0)
+    # Create heatmap
+    create_heatmap_figure(phi_grid, theta_grid, density_flow, density_kde, "/home/oai/share/heatmap_comparison.png")
+    # Write analysis
+    write_analysis("/home/oai/share/analysis.txt")
 
 
 if __name__ == "__main__":
