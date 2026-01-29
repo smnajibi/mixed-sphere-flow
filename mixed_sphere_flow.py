@@ -351,20 +351,91 @@ def compute_kde(phi_data: np.ndarray, theta_data: np.ndarray, kappa: float = 10.
     return kde
 
 
-def create_heatmap_figure(phi_grid: np.ndarray, theta_grid: np.ndarray, density_flow: np.ndarray, density_kde: np.ndarray, filename: str) -> None:
-    """Plot a Mollweide heatmap of the flow density and the KDE."""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), subplot_kw={"projection": "mollweide"}, constrained_layout=True)
-    vmin = 0.0
-    vmax = max(density_flow.max(), density_kde.max())
-    for ax, density, title in zip(axes, [density_flow, density_kde], ["Mixed flow density", "Empirical KDE"]):
-        im = ax.pcolormesh(phi_grid, theta_grid, density, cmap="viridis", shading="auto", vmin=vmin, vmax=vmax)
-        ax.set_title(title)
-        ax.grid(True, linestyle=":", alpha=0.5)
-    cbar = fig.colorbar(im, ax=axes.ravel().tolist(), orientation='horizontal', fraction=0.05, pad=0.07)
-    cbar.set_label('Density')
-    fig.suptitle("Cross‑coupled spline flow vs KDE on S²")
+def def create_heatmap_figure(
+    phi_grid: np.ndarray,
+    theta_grid: np.ndarray,
+    density_flow: np.ndarray,
+    density_kde: np.ndarray,
+    filename: str,
+) -> None:
+    """
+    Plot a Mollweide heatmap of the learned density, the empirical KDE and
+    their difference.
+
+    Both the flow density and the KDE are normalised by their respective
+    maxima before plotting so that their dynamic ranges are comparable.
+    A third panel displays the difference between these normalised
+    densities.  This helps to visualise where the flow under ‑ or
+    over ‑estimates the target density.
+
+    Args:
+        phi_grid: 2D array of longitudes on a regular grid (radians).
+        theta_grid: 2D array of colatitudes (latitude tilt) on a regular grid (radians).
+        density_flow: 2D array of flow ‑estimated densities on the grid.
+        density_kde: 2D array of kernel density estimates on the grid.
+        filename: path to save the resulting figure (typically `.png`).
+    """
+    # normalise each density to have maximum value one to make the
+    # colormap scales comparable across panels
+    flow_norm = density_flow / max(density_flow.max(), 1e‑12)
+    kde_norm = density_kde / max(density_kde.max(), 1e‑12)
+    diff = flow_norm - kde_norm
+    # set up a 1x3 figure with individual colorbars.  Use constrained
+    # layout to avoid the previous tight_layout warnings.
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(18, 5),
+        subplot_kw={"projection": "mollweide"},
+        constrained_layout=True,
+    )
+    # Plot flow density
+    im0 = axes[0].pcolormesh(
+        phi_grid,
+        theta_grid,
+        flow_norm,
+        cmap="viridis",
+        shading="auto",
+        vmin=0.0,
+        vmax=1.0,
+    )
+    axes[0].set_title("Flow density (normalised)")
+    axes[0].grid(True, linestyle=":", alpha=0.5)
+    cbar0 = fig.colorbar(im0, ax=axes[0], orientation="vertical", fraction=0.046, pad=0.04)
+    cbar0.set_label("Normalised density")
+    # Plot KDE density
+    im1 = axes[1].pcolormesh(
+        phi_grid,
+        theta_grid,
+        kde_norm,
+        cmap="viridis",
+        shading="auto",
+        vmin=0.0,
+        vmax=1.0,
+    )
+    axes[1].set_title("KDE (normalised)")
+    axes[1].grid(True, linestyle=":", alpha=0.5)
+    cbar1 = fig.colorbar(im1, ax=axes[1], orientation="vertical", fraction=0.046, pad=0.04)
+    cbar1.set_label("Normalised density")
+    # Plot difference
+    vmax_diff = max(abs(diff.max()), abs(diff.min()), 1e‑12)
+    im2 = axes[2].pcolormesh(
+        phi_grid,
+        theta_grid,
+        diff,
+        cmap="RdBu_r",
+        shading="auto",
+        vmin=-vmax_diff,
+        vmax=vmax_diff,
+    )
+    axes[2].set_title("Flow – KDE (norm.)")
+    axes[2].grid(True, linestyle=":", alpha=0.5)
+    cbar2 = fig.colorbar(im2, ax=axes[2], orientation="vertical", fraction=0.046, pad=0.04)
+    cbar2.set_label("Normalised difference")
+    fig.suptitle("Cross coupled flow vs kernel density estimate on S²")
     fig.savefig(filename)
     plt.close(fig)
+
 
 
 def write_analysis(filename: str) -> None:
