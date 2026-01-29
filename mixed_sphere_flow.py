@@ -370,20 +370,7 @@ def create_heatmap_figure(phi_grid: np.ndarray, theta_grid: np.ndarray, density_
 def write_analysis(filename: str) -> None:
     """Write a short analysis explaining the benefits of the cross‑coupled flow."""
     text = (
-        "This report accompanies the cross‑coupled spline flow implementation on the sphere.\n\n"
-        "The earlier one‑layer model could only reweight the longitude and latitude\n"
-        "independently, so it failed to capture multimodal behaviour along the equator.\n"
-        "In contrast, the new architecture introduces conditional transformations:\n"
-        "the slopes of the longitude spline depend on the latitude and vice versa.\n"
-        "By stacking two such layers, the flow is able to model multiple peaks along\n"
-        "the equator, as seen in the heatmap of the learned density.  The\n"
-        "conditional shifts and slopes remain simple linear functions of the\n"
-        "coordinates, which keeps the parameter count manageable and allows the\n"
-        "model to be trained with SciPy's optimisation routines.  A sphere\n"
-        "correction term (\log(\sin\theta)) is still subtracted to account for\n"
-        "the area element on S².  Overall, this cross‑coupled design demonstrates\n"
-        "how even modest coupling between angular directions dramatically improves\n"
-        "the flexibility of normalising flows on non‑Euclidean spaces."
+"the flexibility of normalising flows on non‑Euclidean spaces."
     )
     with open(filename, "w") as f:
         f.write(text)
