@@ -1,10 +1,15 @@
-On the sphere the longitudinal and latitudinal coordinates have distinct geometries.
-Longitude (ϕ) wraps around, so its density must be periodic.  A flow that ignores this
-periodicity can accumulate probability mass at an arbitrary branch cut and miss the fact
-that ϕ=−π and ϕ=π represent the same physical direction.  By introducing a circular shift
-and a periodic spline we ensure that the transformation acts on a circle rather than a
-line segment.  Conversely, the latitude (θ̃) lies on a bounded interval and has no
-intrinsic wrap‑around.  Using a bounded monotonic spline allows the model to flexibly
-reshape the distribution within the allowed range without introducing artificial
-periodicity.  The resulting mixed flow therefore respects the topology of S²: one
-direction is treated as circular and the other as a finite segment.
+This report accompanies the cross‑coupled spline flow implementation on the sphere.
+
+The earlier one‑layer model could only reweight the longitude and latitude
+independently, so it failed to capture multimodal behaviour along the equator.
+In contrast, the new architecture introduces conditional transformations:
+the slopes of the longitude spline depend on the latitude and vice versa.
+By stacking two such layers, the flow is able to model multiple peaks along
+the equator, as seen in the heatmap of the learned density.  The
+conditional shifts and slopes remain simple linear functions of the
+coordinates, which keeps the parameter count manageable and allows the
+model to be trained with SciPy's optimisation routines.  A sphere
+correction term (\log(\sin\theta)) is still subtracted to account for
+the area element on S².  Overall, this cross‑coupled design demonstrates
+how even modest coupling between angular directions dramatically improves
+the flexibility of normalising flows on non‑Euclidean spaces.
