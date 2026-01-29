@@ -351,7 +351,7 @@ def compute_kde(phi_data: np.ndarray, theta_data: np.ndarray, kappa: float = 10.
     return kde
 
 
-def def create_heatmap_figure(
+def create_heatmap_figure(
     phi_grid: np.ndarray,
     theta_grid: np.ndarray,
     density_flow: np.ndarray,
@@ -377,8 +377,8 @@ def def create_heatmap_figure(
     """
     # normalise each density to have maximum value one to make the
     # colormap scales comparable across panels
-    flow_norm = density_flow / max(density_flow.max(), 1e‑12)
-    kde_norm = density_kde / max(density_kde.max(), 1e‑12)
+    flow_norm = density_flow / max(density_flow.max(), 1e-12)
+    kde_norm = density_kde / max(density_kde.max(), 1e-12)
     diff = flow_norm - kde_norm
     # set up a 1x3 figure with individual colorbars.  Use constrained
     # layout to avoid the previous tight_layout warnings.
@@ -418,7 +418,7 @@ def def create_heatmap_figure(
     cbar1 = fig.colorbar(im1, ax=axes[1], orientation="vertical", fraction=0.046, pad=0.04)
     cbar1.set_label("Normalised density")
     # Plot difference
-    vmax_diff = max(abs(diff.max()), abs(diff.min()), 1e‑12)
+    vmax_diff = max(abs(diff.max()), abs(diff.min()), 1e-12)
     im2 = axes[2].pcolormesh(
         phi_grid,
         theta_grid,
