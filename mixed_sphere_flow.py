@@ -408,7 +408,10 @@ def main() -> None:
     best_params, nll_history = train_flow(flow, phi_norm, theta_norm, maxiter=50)
     flow.params = best_params  # store optimised parameters
     # Write training log
-    with open("/home/oai/share/training_log.csv", "w", newline="") as csvfile:
+     # Write training log to the current working directory.  Using
+    # absolute paths such as /home/oai/share/ works in the container but
+    # fails when running locally, so we write to a relative path.
+    with open("training_log.csv", "w", newline="") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(["iteration", "mean_nll"])
         for i, val in enumerate(nll_history, 1):
@@ -419,10 +422,11 @@ def main() -> None:
     phi_rad = phi_norm * 2 * math.pi - math.pi
     theta_tilde = theta_norm * math.pi - math.pi / 2
     density_kde = compute_kde(phi_rad, theta_tilde, kappa=5.0)
-    # Create heatmap
-    create_heatmap_figure(phi_grid, theta_grid, density_flow, density_kde, "/home/oai/share/heatmap_comparison.png")
-    # Write analysis
-    write_analysis("/home/oai/share/analysis.txt")
+    # Create heatmap and save to a local file
+    create_heatmap_figure(phi_grid, theta_grid, density_flow, density_kde, "heatmap_comparison.png")
+    # Write analysis text to a local file
+    write_analysis("analysis.txt")
+
 
 
 if __name__ == "__main__":
